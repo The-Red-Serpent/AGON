@@ -1,4 +1,3 @@
-
 from scapy.all import ARP, Ether, srp
 import time
 import random
@@ -9,7 +8,7 @@ import ipaddress
 import os
 import socket
 import threading
-from queue import Queue
+from queue import Queue, Empty
 from scapy.config import conf
 
 
@@ -37,7 +36,6 @@ $$ |  $$ |$$ \__$$ |$$ \__$$ |$$ |$$$$ |    $$ |
 $$ |  $$ |$$    $$/ $$    $$/ $$ | $$$ |    $$ |    
 $$/   $$/  $$$$$$/   $$$$$$/  $$/   $$/     $$/     
 '''
-    # Print ASCII Art
     print(f"{BLUE}{death_art}{RESET}")
     print(f"{RED}{BOLD}Author : The Red Serpent{RESET}")
 
@@ -84,14 +82,13 @@ def get_default_interface():
         if not conf.ifaces:
             raise Exception("No interfaces detected in Scapy config. Specify with -i.")
         
-        
         conf.ifaces.refresh()
         
         if os_name == "windows":
             for iface in conf.ifaces:
                 if "Wi-Fi" in iface.description or "Ethernet" in iface.description:
                     return iface.name
-            return conf.ifaces[0].name 
+            return conf.ifaces[0].name
         elif os_name == "linux":
             return conf.iface or "eth0"
         else:
@@ -103,24 +100,32 @@ def get_default_interface():
 
 def arp_scan_worker(ip_queue, result_queue, interface, fast, aggressive, verbose):
     """Worker function for threaded ARP scanning"""
-    timeout = 1 if fast else 4  
-    retries = 0 if fast else 3  
-    delay_range = (0.01, 0.05) if fast else (0.05, 0.2) 
+    timeout = 1 if fast else 4
+    retries = 0 if fast else 3
+    delay_range = (0.01, 0.05) if fast else (0.05, 0.2)
     
     if aggressive:
         timeout = 5
         retries = 5
-        delay_range = (0.005, 0.01) 
+        delay_range = (0.005, 0.01)
     
-    while not ip_queue.empty():
+    while True:
+        # FIX 1: Use try/except on get_nowait instead of checking empty() first.
+        # The old empty() + get_nowait() pattern had a race condition where another
+        # thread could drain the queue between the check and the get.
         try:
             ip = ip_queue.get_nowait()
-            ip_str = str(ip)
+        except Empty:
+            break
+
+        ip_str = str(ip)
+        try:
             arp_request = ARP(pdst=ip_str)
             broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
             arp_request_broadcast = broadcast / arp_request
 
-            answered_list = srp(arp_request_broadcast, timeout=timeout, retry=retries, inter=random.uniform(*delay_range), verbose=0, iface=interface)[0]
+            answered_list = srp(arp_request_broadcast, timeout=timeout, retry=retries,
+                                 inter=random.uniform(*delay_range), verbose=0, iface=interface)[0]
             
             if answered_list:
                 for sent, received in answered_list:
@@ -152,22 +157,18 @@ def arp_scan_live_hosts(target_range, interface=None, fast=False, aggressive=Fal
     ip_queue = Queue()
     result_queue = Queue()
     
-    # Fill the queue with IPs
     for ip in target_ips:
         ip_queue.put(ip)
     
-    # Start worker threads
     threads = []
-    for _ in range(min(num_threads, len(target_ips))):  # Don't exceed number of IPs
+    for _ in range(min(num_threads, len(target_ips))):
         t = threading.Thread(target=arp_scan_worker, args=(ip_queue, result_queue, interface, fast, aggressive, verbose))
-        t.daemon = True  # Threads terminate with main program
+        t.daemon = True
         t.start()
         threads.append(t)
     
-    # Wait for all IPs to be processed
     ip_queue.join()
     
-    # Collect results
     while not result_queue.empty():
         live_hosts.append(result_queue.get())
     
@@ -181,10 +182,11 @@ def stealth_scan(ip_range, interface=None, dns_server=None, fast=False, aggressi
         interface = get_default_interface()
         if not interface:
             print(f"{BOLD}[!] No interface. Use -i.{RESET}")
-            return []
+            # FIX 2: Always return a tuple so the caller can always unpack two values.
+            return [], []
     
     devices = []
-    unresolved_ips = [] 
+    unresolved_ips = []
     
     try:
         print(f"{BLUE}└── Performing ARP scan...{RESET}")
@@ -192,7 +194,8 @@ def stealth_scan(ip_range, interface=None, dns_server=None, fast=False, aggressi
         
         if not live_hosts:
             print(f"{BOLD}[!] No live hosts found{RESET}")
-            return []
+            # FIX 2 (cont): Was returning bare [] which broke tuple unpacking in main().
+            return [], []
 
         print(f"{BLUE}└── Found {len(live_hosts)} live hosts{RESET}")
         
@@ -218,29 +221,37 @@ def stealth_scan(ip_range, interface=None, dns_server=None, fast=False, aggressi
         
     except PermissionError:
         print(f"{BOLD}[!] Run with admin/root privileges{RESET}")
-        return []
+        return [], []
     except Exception as e:
         print(f"{BOLD}[!] Scan error:{RESET} {str(e)}")
-        return []
+        return [], []
     
     return devices, unresolved_ips
 
 def resolve_hostname(ip, dns_server=None):
-    """Resolve hostname using sockets"""
-    socket.setdefaulttimeout(2)
+    """Resolve hostname, optionally using a custom DNS server via dnspython."""
+    # FIX 3: The old code connected a UDP socket to the DNS server but then called
+    # socket.gethostbyaddr() which always uses the OS resolver — the custom server
+    # was completely ignored. Use dnspython for proper custom-DNS PTR lookups.
     if dns_server:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            sock.connect((dns_server, 53))
-            return socket.gethostbyaddr(ip)[0]
-        finally:
-            sock.close()
+            import dns.resolver
+            import dns.reversename
+            rev_name = dns.reversename.from_address(ip)
+            resolver = dns.resolver.Resolver()
+            resolver.nameservers = [dns_server]
+            resolver.timeout = 2
+            resolver.lifetime = 2
+            answer = resolver.resolve(rev_name, "PTR")
+            return str(answer[0]).rstrip(".")
+        except Exception:
+            raise socket.herror(f"PTR lookup failed for {ip} via {dns_server}")
     else:
+        socket.setdefaulttimeout(2)
         return socket.gethostbyaddr(ip)[0]
 
 def print_results(devices, unresolved_ips):
     """Print scan results with a pretty table and unresolved IPs"""
-    # Print resolved devices
     print(f"\n{BOLD}Discovered Devices with Resolved Hostnames:{RESET}")
     print("┌──────────────────┬────────────────────┬──────────────────────────────┐")
     print(f"│ {'IP Address':<16} │ {'MAC Address':<18} │ {'Hostname':<28} │")
@@ -252,12 +263,12 @@ def print_results(devices, unresolved_ips):
     print("└──────────────────┴────────────────────┴──────────────────────────────┘")
     print(f"{BLUE}Total devices with resolved hostnames:{RESET} {len(devices)}\n")
     
-    # Print unresolved IPs
     if unresolved_ips:
         print(f"{BOLD}Live IPs Unable to Resolve Hostnames:{RESET}")
         print("┌──────────────────┬────────────────────┐")
         print(f"│ {'IP Address':<16} │ {'MAC Address':<18} │")
-        print("├──────────────────┼────────────────────┼")
+        # FIX 4: Was "┼" (a cross connector) instead of "┤" (right border), breaking the table visually.
+        print("├──────────────────┼────────────────────┤")
         
         for device in unresolved_ips:
             print(f"│ {device['ip']:<16} │ {device['mac']:<18} │")
@@ -266,7 +277,7 @@ def print_results(devices, unresolved_ips):
         print(f"{BLUE}Total unresolved IPs:{RESET} {len(unresolved_ips)}")
 
 def main():
-    print_ascii_art() 
+    print_ascii_art()
     
     args = get_arguments()
     target_range = args.target
